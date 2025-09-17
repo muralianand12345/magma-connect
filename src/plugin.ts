@@ -75,7 +75,6 @@ export class MagmaConnect extends Plugin {
 		manager.create = ((opts: PlayerOptions) => {
 			const patched = { ...opts };
 			if (!patched.nodeIdentifier) {
-				// IMPORTANT: use synchronous cached target (guild -> self) to avoid async Promise causing fallback
 				const target = () => this.getTargetForGuildSync(patched.guildId);
 				const id = this.pickBestNodeIdentifier(target);
 				if (id) patched.nodeIdentifier = id;
