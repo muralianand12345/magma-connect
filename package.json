@@ -1,6 +1,6 @@
 {
 	"name": "magma-connect",
-	"version": "0.1.1-beta",
+	"version": "0.1.2-beta",
 	"description": "A smart magamastream plugin to connect nodes based on their region.",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",

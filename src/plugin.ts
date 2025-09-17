@@ -24,7 +24,7 @@ export interface MagmaConnectOptions {
 	 */
 	refreshIntervalMs?: number;
 	/**
-	 * Enables debug logging prefixed with [MagmaConnect].
+	 * Enables debug logging prefixed with [MAGMACONNECT].
 	 */
 	debug?: boolean;
 }
@@ -75,9 +75,12 @@ export class MagmaConnect extends Plugin {
 		manager.create = ((opts: PlayerOptions) => {
 			const patched = { ...opts };
 			if (!patched.nodeIdentifier) {
-				const target = () => this.getTargetForGuild(patched.guildId);
+				// IMPORTANT: use synchronous cached target (guild -> self) to avoid async Promise causing fallback
+				const target = () => this.getTargetForGuildSync(patched.guildId);
 				const id = this.pickBestNodeIdentifier(target);
 				if (id) patched.nodeIdentifier = id;
+				// Warm async cache in background so subsequent creates have richer data
+				void this.getTargetForGuild(patched.guildId).catch(() => void 0);
 			}
 			return this.originalCreate!(patched);
 		}) as Manager['create'];
@@ -157,15 +160,25 @@ export class MagmaConnect extends Plugin {
 			const id = n.options.identifier ?? n.options.host;
 			if (this.options.nodeLocations && this.options.nodeLocations[id]) {
 				const ll = await this.normalizeLoc(this.options.nodeLocations[id]);
-				if (ll) this.nodeGeo.set(id, ll);
+				if (ll) {
+					this.nodeGeo.set(id, ll);
+					this.log(`Node ${id} location set from override => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
+				} else {
+					this.log(`Node ${id} override provided but could not be normalized`);
+				}
 				continue;
 			}
 			promises.push(
 				this.resolveNodeLocation(n.options)
 					.then((ll) => {
-						if (ll) this.nodeGeo.set(id, ll);
+						if (ll) {
+							this.nodeGeo.set(id, ll);
+							this.log(`Node ${id} resolved via host lookup => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
+						} else {
+							this.log(`Node ${id} location could not be determined (no override, host lookup failed)`);
+						}
 					})
-					.catch(() => void 0)
+					.catch((e) => this.log(`Node ${id} location resolution error: ${(e as Error).message}`))
 			);
 		}
 		await Promise.all(promises);
@@ -179,7 +192,11 @@ export class MagmaConnect extends Plugin {
 		const id = node.identifier ?? node.host;
 		const override = this.options.nodeLocations?.[id];
 		if (override) return this.normalizeLoc(override);
-		const byHost = await this.geoByHost(node.host).catch(() => undefined);
+		this.log(`Resolving node ${id} location via host ${node.host}`);
+		const byHost = await this.geoByHost(node.host).catch((e) => {
+			this.log(`Error during host geo lookup for ${id}: ${(e as Error).message}`);
+			return undefined;
+		});
 		if (byHost) return byHost;
 		return undefined;
 	};
@@ -194,7 +211,11 @@ export class MagmaConnect extends Plugin {
 			`http://ip-api.com/json/${encodeURIComponent(host)}?fields=status,lat,lon`,
 		];
 		for (const url of urls) {
-			const data = await this.fetchJson(url, 4500).catch(() => undefined);
+			this.log(`Fetching geo for ${host} via ${url}`);
+			const data = await this.fetchJson(url, 4500).catch((e) => {
+				this.log(`Geo fetch error for ${host} via ${url}: ${(e as Error).message}`);
+				return undefined;
+			});
 			if (!data) continue;
 			if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number')
 				return { lat: data.latitude, lon: data.longitude };
@@ -212,9 +233,26 @@ export class MagmaConnect extends Plugin {
 		if (cached) return cached;
 		if (this.options.getGuildLocation) {
 			const v = await this.options.getGuildLocation(guildId);
-			if (v) return this.normalizeLoc(v);
+			if (v) {
+				const ll = await this.normalizeLoc(v);
+				if (ll) {
+					this.guildGeo.set(guildId, ll);
+					return ll;
+				}
+			}
 		}
 		return this.getSelfLocationCached();
+	};
+
+	/**
+	 * Fast, synchronous variant that returns only cached data for a guild's target location.
+	 * This avoids returning a Promise during Manager.create, which would otherwise force
+	 * a fallback path before async resolution completes.
+	 *
+	 * Order: cached guild region -> cached self (host) geolocation -> undefined
+	 */
+	private getTargetForGuildSync = (guildId: string): LatLon | undefined => {
+		return this.guildGeo.get(guildId) ?? this.selfGeo;
 	};
 
 	/**
@@ -222,9 +260,13 @@ export class MagmaConnect extends Plugin {
 	 */
 	private getSelfLocationCached = (): LatLon | undefined => {
 		if (this.selfGeo) return this.selfGeo;
+		this.log('Self geo not cached, triggering background fetch');
 		void this.getSelfLocation()
-			.then((ll) => (this.selfGeo = ll))
-			.catch(() => void 0);
+			.then((ll) => {
+				this.selfGeo = ll;
+				if (ll) this.log(`Self location cached => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
+			})
+			.catch((e) => this.log(`Self geo fetch error: ${(e as Error).message}`));
 		return this.selfGeo;
 	};
 
@@ -232,9 +274,17 @@ export class MagmaConnect extends Plugin {
 	 * Fetches bot host geolocation using public APIs.
 	 */
 	private getSelfLocation = async (): Promise<LatLon | undefined> => {
-		const data = await this.fetchJson('https://ipwho.is/?fields=success,latitude,longitude', 4500).catch(() => undefined);
+		this.log('Fetching self geo from ipwho.is');
+		const data = await this.fetchJson('https://ipwho.is/?fields=success,latitude,longitude', 4500).catch((e) => {
+			this.log(`Self geo fetch error (ipwho.is): ${(e as Error).message}`);
+			return undefined;
+		});
 		if (data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') return { lat: data.latitude, lon: data.longitude };
-		const data2 = await this.fetchJson('http://ip-api.com/json/?fields=status,lat,lon', 4500).catch(() => undefined);
+		this.log('Fetching self geo from ip-api.com');
+		const data2 = await this.fetchJson('http://ip-api.com/json/?fields=status,lat,lon', 4500).catch((e) => {
+			this.log(`Self geo fetch error (ip-api.com): ${(e as Error).message}`);
+			return undefined;
+		});
 		if (data2 && data2.status === 'success' && typeof data2.lat === 'number' && typeof data2.lon === 'number') return { lat: data2.lat, lon: data2.lon };
 		return undefined;
 	};
@@ -383,12 +433,12 @@ export class MagmaConnect extends Plugin {
 	/**
 	 * Debug logger for the plugin.
 	 *
-	 * Prefixed with [MagmaConnect] and only emits output when `options.debug` is true.
+	 * Prefixed with [MAGMACONNECT] and only emits output when `options.debug` is true.
 	 * Use this for internal diagnostics; production users can disable by leaving `debug` unset/false.
 	 *
 	 * @param msg The message to print when debug logging is enabled.
 	 */
 	private log = (msg: string): void => {
-		if (this.options.debug) console.log(`[MagmaConnect] ${msg}`);
+		if (this.options.debug) console.log(`[MAGMACONNECT] ${msg}`);
 	};
 }
