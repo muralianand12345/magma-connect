@@ -1,6 +1,6 @@
 {
 	"name": "magma-connect",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "A smart magmastream plugin to connect nodes based on their region.",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
@@ -17,7 +17,8 @@
 	"scripts": {
 		"build": "tsc",
 		"lint": "eslint --ext .ts ./src",
-		"ci": "eslint --ext .ts ./src && tsc"
+		"ci": "eslint --ext .ts ./src && tsc",
+		"prepublishOnly": "yarn build"
 	},
 	"devDependencies": {
 		"@types/node": "^24.5.1",
