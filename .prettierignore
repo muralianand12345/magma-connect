@@ -1,0 +1,8 @@
+LICENSE
+package.json
+package-lock.json
+.npmignore
+.gitignore
+.gitattributes
+node_modules
+dist
