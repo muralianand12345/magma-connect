@@ -1,22 +1,20 @@
-import { Plugin } from "magmastream";
+import { Plugin } from 'magmastream';
 
-// .. Functions for the plugin example add a check function to make sure everything for the plugin is passed
-// .. when a user want to use the plugin, etc...
-
-export class ExamplePlugin extends Plugin {
+export class MagmaConnect extends Plugin {
 	private readonly options: MyOptions;
-	// .. Varibles defined here as either public or private.
-	// private myVar: string;
-
 	public constructor(options: MyOptions) {
-		super();
-		// .. If you have a check function call it here. ex: 'check()'
-		this.options = options; // .. edit to your code needs.
-		// ... rest of your code.
+		super("ExamplePlugin");
+		this.options = options;
+	}
+
+	public load(manager: import("magmastream").Manager): void {
+		console.log("ExamplePlugin loaded with options:", this.options);
+	}
+
+	public unload(manager: import("magmastream").Manager): void {
+		console.log("ExamplePlugin unloaded");
 	}
 }
-
-// .. Interfaces, types, etc... are defined here.
 
 export interface MyOptions {
 	test?: string;
