@@ -1,9 +1,69 @@
 import { Plugin, Manager, NodeOptions, PlayerOptions } from 'magmastream';
+import type { VoicePacket, VoiceServer, VoiceState } from 'magmastream';
 
 /**
  * Geographic coordinate in decimal degrees.
  */
-type LatLon = { lat: number; lon: number };
+export type LatLon = { lat: number; lon: number };
+
+/**
+ * Discord voice server update payload structure.
+ */
+export interface VoiceServerUpdate {
+	guild_id: string;
+	endpoint: string;
+}
+
+/**
+ * Discord gateway message structure for voice server updates.
+ */
+export interface DiscordGatewayMessage {
+	t?: string;
+	d?: {
+		guild_id?: string;
+		endpoint?: string;
+	};
+}
+
+/**
+ * Voice update data that can contain various payload structures.
+ */
+export interface VoiceUpdateData {
+	guild_id?: string;
+	endpoint?: string;
+	event?: {
+		guild_id?: string;
+		endpoint?: string;
+	};
+	t?: string;
+	d?: {
+		guild_id?: string;
+		endpoint?: string;
+	};
+}
+
+/**
+ * Response structure from ipwho.is API.
+ */
+export interface IpWhoResponse {
+	success: boolean;
+	latitude?: number;
+	longitude?: number;
+}
+
+/**
+ * Response structure from ip-api.com API.
+ */
+export interface IpApiResponse {
+	status: string;
+	lat?: number;
+	lon?: number;
+}
+
+/**
+ * Union type for geolocation API responses.
+ */
+export type GeoApiResponse = IpWhoResponse | IpApiResponse;
 
 /**
  * Options for the MagmaConnect plugin.
@@ -70,24 +130,20 @@ export class MagmaConnect extends Plugin {
 			}, this.options.refreshIntervalMs);
 		}
 
-		// Patch Manager.create to inject best nodeIdentifier if missing
 		this.originalCreate = manager.create.bind(manager);
 		manager.create = ((opts: PlayerOptions) => {
 			const patched = { ...opts };
 			if (!patched.nodeIdentifier) {
-				// IMPORTANT: use synchronous cached target (guild -> self) to avoid async Promise causing fallback
 				const target = () => this.getTargetForGuildSync(patched.guildId);
 				const id = this.pickBestNodeIdentifier(target);
 				if (id) patched.nodeIdentifier = id;
-				// Warm async cache in background so subsequent creates have richer data
 				void this.getTargetForGuild(patched.guildId).catch(() => void 0);
 			}
 			return this.originalCreate!(patched);
 		}) as Manager['create'];
 
-		// Patch Manager.updateVoiceState to capture guild voice endpoint -> region mapping
 		this.originalUpdateVoiceState = manager.updateVoiceState.bind(manager);
-		manager.updateVoiceState = (async (data: any) => {
+		manager.updateVoiceState = (async (data: VoicePacket | VoiceServer | VoiceState) => {
 			try {
 				const vs = this.extractVoiceServerUpdate(data);
 				if (vs && vs.guild_id && vs.endpoint) {
@@ -212,13 +268,12 @@ export class MagmaConnect extends Plugin {
 		];
 		for (const url of urls) {
 			this.log(`Fetching geo for ${host} via ${url}`);
-			const data = await this.fetchJson(url, 4500).catch((e) => {
+			const data = await this.fetchJson<GeoApiResponse>(url, 4500).catch((e) => {
 				this.log(`Geo fetch error for ${host} via ${url}: ${(e as Error).message}`);
 				return undefined;
 			});
 			if (!data) continue;
-			if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number')
-				return { lat: data.latitude, lon: data.longitude };
+			if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') return { lat: data.latitude, lon: data.longitude };
 			if ('status' in data && data.status === 'success' && typeof data.lat === 'number' && typeof data.lon === 'number') return { lat: data.lat, lon: data.lon };
 		}
 		return undefined;
@@ -275,17 +330,19 @@ export class MagmaConnect extends Plugin {
 	 */
 	private getSelfLocation = async (): Promise<LatLon | undefined> => {
 		this.log('Fetching self geo from ipwho.is');
-		const data = await this.fetchJson('https://ipwho.is/?fields=success,latitude,longitude', 4500).catch((e) => {
+		const data = await this.fetchJson<IpWhoResponse>('https://ipwho.is/?fields=success,latitude,longitude', 4500).catch((e) => {
 			this.log(`Self geo fetch error (ipwho.is): ${(e as Error).message}`);
 			return undefined;
 		});
 		if (data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') return { lat: data.latitude, lon: data.longitude };
+
 		this.log('Fetching self geo from ip-api.com');
-		const data2 = await this.fetchJson('http://ip-api.com/json/?fields=status,lat,lon', 4500).catch((e) => {
+		const data2 = await this.fetchJson<IpApiResponse>('http://ip-api.com/json/?fields=status,lat,lon', 4500).catch((e) => {
 			this.log(`Self geo fetch error (ip-api.com): ${(e as Error).message}`);
 			return undefined;
 		});
 		if (data2 && data2.status === 'success' && typeof data2.lat === 'number' && typeof data2.lon === 'number') return { lat: data2.lat, lon: data2.lon };
+
 		return undefined;
 	};
 
@@ -321,12 +378,21 @@ export class MagmaConnect extends Plugin {
 	/**
 	 * Extracts a Voice Server Update shape from multiple possible payloads.
 	 */
-	private extractVoiceServerUpdate = (data: any): { guild_id: string; endpoint: string } | undefined => {
+	private extractVoiceServerUpdate = (data: unknown): VoiceServerUpdate | undefined => {
 		if (data && typeof data === 'object') {
-			if (data.t === 'VOICE_SERVER_UPDATE' && data.d && typeof data.d.endpoint === 'string') return { guild_id: data.d.guild_id, endpoint: data.d.endpoint };
-			if (typeof data.endpoint === 'string' && typeof data.guild_id === 'string') return { guild_id: data.guild_id, endpoint: data.endpoint };
-			if (data.event && typeof data.event.endpoint === 'string' && typeof data.event.guild_id === 'string')
-				return { guild_id: data.event.guild_id, endpoint: data.event.endpoint };
+			const anyData = data as Record<string, any>;
+			// Discord gateway packet style
+			if (anyData.t === 'VOICE_SERVER_UPDATE' && anyData.d && typeof anyData.d.endpoint === 'string' && typeof anyData.d.guild_id === 'string') {
+				return { guild_id: anyData.d.guild_id, endpoint: anyData.d.endpoint };
+			}
+			// Raw VoiceServer style
+			if ('endpoint' in anyData && typeof (anyData as any).endpoint === 'string' && 'guild_id' in anyData && typeof (anyData as any).guild_id === 'string') {
+				return { guild_id: (anyData as any).guild_id, endpoint: (anyData as any).endpoint };
+			}
+			// VoiceState-like event wrapper
+			if ('event' in anyData && anyData.event && typeof anyData.event.endpoint === 'string' && typeof anyData.event.guild_id === 'string') {
+				return { guild_id: anyData.event.guild_id, endpoint: anyData.event.endpoint };
+			}
 		}
 		return undefined;
 	};
@@ -392,29 +458,46 @@ export class MagmaConnect extends Plugin {
 	 * @param url Resource URL
 	 * @param timeoutMs Request timeout in milliseconds
 	 */
-	private fetchJson = async (url: string, timeoutMs = 5000): Promise<any> => {
-		return new Promise((resolve, reject) => {
+	private fetchJson = async <T = unknown>(url: string, timeoutMs = 5000): Promise<T> => {
+		return new Promise<T>((resolve, reject) => {
 			const u = new URL(url);
 			const isHttp = u.protocol === 'http:';
 			const mod = isHttp ? require('http') : require('https');
-			const req = mod.request(u, { method: 'GET', timeout: timeoutMs, headers: { 'user-agent': 'magma-connect/0.1' } }, (res: any) => {
-				const statusCode = res.statusCode ?? 0;
-				if (statusCode >= 400) {
-					res.resume();
-					reject(new Error(`HTTP ${statusCode}`));
-					return;
-				}
-				const chunks: Buffer[] = [];
-				res.on('data', (c: Buffer) => chunks.push(c));
-				res.on('end', () => {
-					try {
-						const body = Buffer.concat(chunks).toString('utf8');
-						resolve(body ? JSON.parse(body) : {});
-					} catch (e) {
-						reject(e);
+
+			interface HttpResponse {
+				statusCode?: number;
+				on: (event: string, callback: (data?: Buffer) => void) => void;
+				resume: () => void;
+			}
+
+			const req = mod.request(
+				u,
+				{
+					method: 'GET',
+					timeout: timeoutMs,
+					headers: { 'user-agent': 'magma-connect/0.1' },
+				},
+				(res: HttpResponse) => {
+					const statusCode = res.statusCode ?? 0;
+					if (statusCode >= 400) {
+						res.resume();
+						reject(new Error(`HTTP ${statusCode}`));
+						return;
 					}
-				});
-			});
+					const chunks: Buffer[] = [];
+					res.on('data', (c?: Buffer) => {
+						if (c) chunks.push(c);
+					});
+					res.on('end', () => {
+						try {
+							const body = Buffer.concat(chunks).toString('utf8');
+							resolve(body ? (JSON.parse(body) as T) : ({} as T));
+						} catch (e) {
+							reject(e);
+						}
+					});
+				}
+			);
 			req.on('error', reject);
 			req.on('timeout', () => req.destroy(new Error('Request timeout')));
 			req.end();
@@ -426,7 +509,7 @@ export class MagmaConnect extends Plugin {
 	 * Otherwise returns the value directly.
 	 */
 	private resolveSyncOrAsync = <T>(v: T | Promise<T> | undefined): T | undefined => {
-		if (v && typeof (v as any).then === 'function') return undefined;
+		if (v && typeof (v as Promise<T>).then === 'function') return undefined;
 		return v as T | undefined;
 	};
 
