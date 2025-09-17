@@ -4,8 +4,10 @@ A MagmaStream plugin that picks the best Lavalink node for each guild based on r
 
 ## Install
 
-```
+```bash
 npm install magma-connect
+# or
+npm install muralianand12345/magma-connect#main
 ```
 
 ## Usage
