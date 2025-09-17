@@ -1,8 +1,16 @@
 {
 	"name": "magma-connect",
-	"version": "0.1.0-beta",
+	"version": "0.1.1-beta",
 	"description": "A smart magamastream plugin to connect nodes based on their region.",
 	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"require": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
 	"files": [
 		"dist"
 	],
@@ -23,8 +31,10 @@
 		"typescript": "^5.4.5"
 	},
 	"dependencies": {
-		"magmastream": "^2.9.0",
 		"tslib": "^2.8.1"
+	},
+	"peerDependencies": {
+		"magmastream": "^2.9.0"
 	},
 	"engines": {
 		"node": ">=16.0.0"
