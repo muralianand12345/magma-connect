@@ -1,6 +1,6 @@
 {
 	"name": "magma-connect",
-	"version": "0.1.0",
+	"version": "0.1.0-beta",
 	"description": "A smart magamastream plugin to connect nodes based on their region.",
 	"main": "dist/index.js",
 	"files": [
@@ -48,7 +48,10 @@
 	},
 	"keywords": [
 		"plugin",
-		"magmastream"
+		"magmastream",
+		"region",
+		"loadbalancing",
+		"lavalink"
 	],
 	"repository": {
 		"url": "https://github.com/muralianand12345/magma-connect/tree/main"
