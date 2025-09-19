@@ -25,6 +25,7 @@
 		"@typescript-eslint/eslint-plugin": "^8.44.0",
 		"@typescript-eslint/parser": "^8.44.0",
 		"eslint": "^9.35.0",
+		"magmastream": "^2.9.0",
 		"typescript": "^5.4.5"
 	},
 	"dependencies": {
