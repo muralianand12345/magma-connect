@@ -119,11 +119,11 @@ export class MagmaConnect extends Plugin {
 		manager.create = (opts: PlayerOptions) => {
 			try {
 				const patched = { ...opts };
-				if (!patched.node) {
+				if (!patched.nodeIdentifier) {
 					const target = this.getTargetForGuildSync(patched.guildId);
 					const id = this.pickBestNodeIdentifier(target);
 					if (id) {
-						patched.node = id;
+						patched.nodeIdentifier = id;
 						this.log(`Selected node ${id} for guild ${patched.guildId}`);
 					}
 					this.getTargetForGuild(patched.guildId).catch(() => undefined);
