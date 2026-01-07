@@ -1,127 +1,112 @@
+import http from 'http';
+import https from 'https';
 import { Plugin, Manager, NodeOptions, PlayerOptions } from 'magmastream';
 import type { VoicePacket, VoiceServer, VoiceState } from 'magmastream';
 
-/**
- * Geographic coordinate in decimal degrees.
- */
 export type LatLon = { lat: number; lon: number };
 
-/**
- * Discord voice server update payload structure.
- */
 export interface VoiceServerUpdate {
 	guild_id: string;
 	endpoint: string;
 }
 
-/**
- * Discord gateway message structure for voice server updates.
- */
-export interface DiscordGatewayMessage {
-	t?: string;
-	d?: {
-		guild_id?: string;
-		endpoint?: string;
-	};
-}
-
-/**
- * Voice update data that can contain various payload structures.
- */
-export interface VoiceUpdateData {
-	guild_id?: string;
-	endpoint?: string;
-	event?: {
-		guild_id?: string;
-		endpoint?: string;
-	};
-	t?: string;
-	d?: {
-		guild_id?: string;
-		endpoint?: string;
-	};
-}
-
-/**
- * Response structure from ipwho.is API.
- */
 export interface IpWhoResponse {
 	success: boolean;
 	latitude?: number;
 	longitude?: number;
 }
 
-/**
- * Response structure from ip-api.com API.
- */
 export interface IpApiResponse {
 	status: string;
 	lat?: number;
 	lon?: number;
 }
 
-/**
- * Union type for geolocation API responses.
- */
 export type GeoApiResponse = IpWhoResponse | IpApiResponse;
 
-/**
- * Options for the MagmaConnect plugin.
- */
 export interface MagmaConnectOptions {
-	/**
-	 * Optional explicit node locations keyed by node identifier (or host if no identifier).
-	 * If provided, avoids calling public geo APIs for those nodes.
-	 */
 	nodeLocations?: Record<string, LatLon | { region: string }>;
-	/**
-	 * Optional provider to supply a guild's approximate location or region code.
-	 * If omitted, the plugin uses Discord voice region hints and falls back to the bot host geo.
-	 */
 	getGuildLocation?: (guildId: string) => Promise<LatLon | { region: string } | undefined>;
-	/**
-	 * Interval (ms) to periodically refresh node geolocation. Disable by leaving undefined/0.
-	 */
 	refreshIntervalMs?: number;
-	/**
-	 * Enables debug logging prefixed with [MAGMACONNECT].
-	 */
 	debug?: boolean;
 }
 
-/**
- * Plugin that selects the nearest Lavalink node per guild using regional/geographic hints.
- *
- * It intercepts Manager.create (when nodeIdentifier is omitted) and chooses the closest node
- * based on cached guild region, user-provided guild resolver, or the bot host location.
- */
+interface HttpResponse {
+	statusCode?: number;
+	on: (event: string, callback: (data?: Buffer) => void) => void;
+	resume: () => void;
+}
+
+const REGION_COORDINATES: Record<string, LatLon> = {
+	'us-east': { lat: 39.0, lon: -77.0 },
+	'us-west': { lat: 37.4, lon: -122.0 },
+	'us-central': { lat: 41.6, lon: -93.6 },
+	'us-south': { lat: 29.4, lon: -98.5 },
+	brazil: { lat: -23.5, lon: -46.6 },
+	singapore: { lat: 1.29, lon: 103.85 },
+	hongkong: { lat: 22.32, lon: 114.17 },
+	'hong-kong': { lat: 22.32, lon: 114.17 },
+	russia: { lat: 55.75, lon: 37.62 },
+	europe: { lat: 50.11, lon: 8.68 },
+	'eu-central': { lat: 50.11, lon: 8.68 },
+	'eu-west': { lat: 48.86, lon: 2.35 },
+	sydney: { lat: -33.86, lon: 151.21 },
+	japan: { lat: 35.68, lon: 139.69 },
+	india: { lat: 19.08, lon: 72.88 },
+	southafrica: { lat: -26.2, lon: 28.04 },
+	'south-africa': { lat: -26.2, lon: 28.04 },
+	dubai: { lat: 25.2, lon: 55.27 },
+	frankfurt: { lat: 50.11, lon: 8.68 },
+	london: { lat: 51.51, lon: -0.13 },
+	amsterdam: { lat: 52.37, lon: 4.9 },
+	mumbai: { lat: 19.08, lon: 72.88 },
+	chicago: { lat: 41.88, lon: -87.62 },
+	atlanta: { lat: 33.75, lon: -84.39 },
+	dallas: { lat: 32.78, lon: -96.8 },
+	miami: { lat: 25.77, lon: -80.19 },
+	newyork: { lat: 40.71, lon: -74.01 },
+	'new-york': { lat: 40.71, lon: -74.01 },
+	paris: { lat: 48.86, lon: 2.35 },
+	stockholm: { lat: 59.33, lon: 18.06 },
+	seoul: { lat: 37.57, lon: 126.98 },
+	toronto: { lat: 43.65, lon: -79.38 },
+	montreal: { lat: 45.5, lon: -73.57 },
+};
+
 export class MagmaConnect extends Plugin {
 	private readonly options: MagmaConnectOptions;
 	private manager?: Manager;
 	private interval?: NodeJS.Timeout;
 	private originalCreate?: Manager['create'];
 	private originalUpdateVoiceState?: Manager['updateVoiceState'];
-
 	private nodeGeo = new Map<string, LatLon>();
 	private guildGeo = new Map<string, LatLon>();
-	private selfGeo?: LatLon; // Bot host geolocation as a fallback
+	private selfGeo?: LatLon;
+	private selfGeoPromise?: Promise<LatLon | undefined>;
+	private isLoaded = false;
 
-	/**
-	 * Creates a new MagmaConnect plugin instance.
-	 * @param options Plugin configuration.
-	 */
 	public constructor(options: MagmaConnectOptions = {}) {
 		super('MagmaConnect');
 		this.options = options;
 	}
 
-	/**
-	 * Loads the plugin: caches manager reference, starts node geo refresh, and patches Manager methods.
-	 * @param manager MagmaStream Manager instance.
-	 */
 	public load = (manager: Manager): void => {
+		if (this.isLoaded) return;
+		this.isLoaded = true;
 		this.manager = manager;
 		this.log('Loading MagmaConnect plugin');
+
+		this.selfGeoPromise = this.getSelfLocation()
+			.then((ll) => {
+				this.selfGeo = ll;
+				if (ll) this.log(`Self location cached => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
+				return ll;
+			})
+			.catch((e) => {
+				this.log(`Self geo fetch error: ${(e as Error).message}`);
+				return undefined;
+			});
+
 		this.refreshAllNodeLocations().catch((err) => this.log('Node geo refresh error: ' + (err as Error).message));
 
 		if (this.options.refreshIntervalMs && this.options.refreshIntervalMs > 0) {
@@ -131,22 +116,30 @@ export class MagmaConnect extends Plugin {
 		}
 
 		this.originalCreate = manager.create.bind(manager);
-		manager.create = ((opts: PlayerOptions) => {
-			const patched = { ...opts };
-			if (!patched.nodeIdentifier) {
-				const target = () => this.getTargetForGuildSync(patched.guildId);
-				const id = this.pickBestNodeIdentifier(target);
-				if (id) patched.nodeIdentifier = id;
-				void this.getTargetForGuild(patched.guildId).catch(() => void 0);
+		manager.create = (opts: PlayerOptions) => {
+			try {
+				const patched = { ...opts };
+				if (!patched.nodeIdentifier) {
+					const target = this.getTargetForGuildSync(patched.guildId);
+					const id = this.pickBestNodeIdentifier(target);
+					if (id) {
+						patched.nodeIdentifier = id;
+						this.log(`Selected node ${id} for guild ${patched.guildId}`);
+					}
+					this.getTargetForGuild(patched.guildId).catch(() => undefined);
+				}
+				return this.originalCreate!(patched);
+			} catch (error) {
+				this.log(`Error in patched create: ${(error as Error).message}`);
+				return this.originalCreate!(opts);
 			}
-			return this.originalCreate!(patched);
-		}) as Manager['create'];
+		};
 
 		this.originalUpdateVoiceState = manager.updateVoiceState.bind(manager);
-		manager.updateVoiceState = (async (data: VoicePacket | VoiceServer | VoiceState) => {
+		manager.updateVoiceState = (data: VoicePacket | VoiceServer | VoiceState) => {
 			try {
 				const vs = this.extractVoiceServerUpdate(data);
-				if (vs && vs.guild_id && vs.endpoint) {
+				if (vs?.guild_id && vs?.endpoint) {
 					const region = this.parseDiscordRegionFromEndpoint(vs.endpoint);
 					const latlon = region ? this.regionToLatLon(region) : undefined;
 					if (latlon) {
@@ -155,44 +148,52 @@ export class MagmaConnect extends Plugin {
 					}
 				}
 			} catch {
-				// ignore
+				// ignore extraction errors
 			}
 			return this.originalUpdateVoiceState!(data);
-		}) as Manager['updateVoiceState'];
+		};
 
 		this.log('MagmaConnect plugin loaded');
 	};
 
-	/**
-	 * Unloads the plugin: clears timers and restores patched Manager methods.
-	 */
 	public unload = (_: Manager): void => {
 		this.log('Unloading MagmaConnect plugin');
-		if (this.interval) clearInterval(this.interval);
-		if (this.manager && this.originalCreate) this.manager.create = this.originalCreate;
-		if (this.manager && this.originalUpdateVoiceState) this.manager.updateVoiceState = this.originalUpdateVoiceState;
+		if (this.interval) {
+			clearInterval(this.interval);
+			this.interval = undefined;
+		}
+		if (this.manager && this.originalCreate) {
+			this.manager.create = this.originalCreate;
+		}
+		if (this.manager && this.originalUpdateVoiceState) {
+			this.manager.updateVoiceState = this.originalUpdateVoiceState;
+		}
+		this.isLoaded = false;
 		this.log('MagmaConnect plugin unloaded');
 	};
 
-	/**
-	 * Chooses the closest node by great-circle distance to the provided target location.
-	 * Falls back to bot host location, then the first available node.
-	 * @param getTarget Function returning target Lat/Lon or a promise to it.
-	 * @returns The chosen node identifier/host or undefined if no nodes are present.
-	 */
-	private pickBestNodeIdentifier = (getTarget: () => Promise<LatLon | undefined> | LatLon | undefined): string | undefined => {
+	private pickBestNodeIdentifier = (target?: LatLon): string | undefined => {
 		const m = this.manager;
 		if (!m || m.nodes.size === 0) return undefined;
 
-		const nodes = [...m.nodes.values()];
-		const target = this.resolveSyncOrAsync(getTarget());
-		const loc = target ?? this.getSelfLocationCached();
-		if (!loc) return nodes[0]?.options.identifier ?? nodes[0]?.options.host; // fallback
+		const nodes = [...m.nodes.values()].filter((n) => n.connected);
+		if (nodes.length === 0) return undefined;
 
-		nodes.forEach((n) => {
+		const loc = target ?? this.selfGeo;
+
+		if (!loc) {
+			const firstNode = nodes[0];
+			return firstNode?.options.identifier ?? firstNode?.options.host;
+		}
+
+		for (const n of nodes) {
 			const id = n.options.identifier ?? n.options.host;
-			if (!this.nodeGeo.has(id)) void this.resolveNodeLocation(n.options).then((ll) => ll && this.nodeGeo.set(id, ll));
-		});
+			if (!this.nodeGeo.has(id)) {
+				this.resolveNodeLocation(n.options)
+					.then((ll) => ll && this.nodeGeo.set(id, ll))
+					.catch(() => undefined);
+			}
+		}
 
 		let best: { id: string; dist: number } | undefined;
 		for (const n of nodes) {
@@ -200,161 +201,146 @@ export class MagmaConnect extends Plugin {
 			const ll = this.nodeGeo.get(id);
 			if (!ll) continue;
 			const d = this.haversineKm(loc, ll);
-			if (!best || d < best.dist) best = { id, dist: d };
+			if (!best || d < best.dist) {
+				best = { id, dist: d };
+			}
 		}
-		return best?.id ?? nodes[0]?.options.identifier ?? nodes[0]?.options.host;
+
+		if (best) {
+			this.log(`Best node: ${best.id} (${best.dist.toFixed(0)}km from target)`);
+			return best.id;
+		}
+
+		const fallbackNode = nodes[0];
+		return fallbackNode?.options.identifier ?? fallbackNode?.options.host;
 	};
 
-	/**
-	 * Resolves and caches geolocation for all configured nodes.
-	 */
 	private refreshAllNodeLocations = async (): Promise<void> => {
 		const m = this.manager;
 		if (!m) return;
+
 		const promises: Promise<void>[] = [];
+
 		for (const n of m.nodes.values()) {
 			const id = n.options.identifier ?? n.options.host;
-			if (this.options.nodeLocations && this.options.nodeLocations[id]) {
-				const ll = await this.normalizeLoc(this.options.nodeLocations[id]);
-				if (ll) {
-					this.nodeGeo.set(id, ll);
-					this.log(`Node ${id} location set from override => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
-				} else {
-					this.log(`Node ${id} override provided but could not be normalized`);
-				}
+
+			if (this.options.nodeLocations?.[id]) {
+				const override = this.options.nodeLocations[id];
+				promises.push(
+					this.normalizeLoc(override)
+						.then((ll) => {
+							if (ll) {
+								this.nodeGeo.set(id, ll);
+								this.log(`Node ${id} location set from override => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
+							}
+						})
+						.catch(() => undefined)
+				);
 				continue;
 			}
+
 			promises.push(
 				this.resolveNodeLocation(n.options)
 					.then((ll) => {
 						if (ll) {
 							this.nodeGeo.set(id, ll);
 							this.log(`Node ${id} resolved via host lookup => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
-						} else {
-							this.log(`Node ${id} location could not be determined (no override, host lookup failed)`);
 						}
 					})
 					.catch((e) => this.log(`Node ${id} location resolution error: ${(e as Error).message}`))
 			);
 		}
-		await Promise.all(promises);
+
+		await Promise.allSettled(promises);
 	};
 
-	/**
-	 * Determines the geolocation of a node using overrides or public IP geo services.
-	 * @param node Node options (host/identifier).
-	 */
 	private resolveNodeLocation = async (node: NodeOptions): Promise<LatLon | undefined> => {
 		const id = node.identifier ?? node.host;
 		const override = this.options.nodeLocations?.[id];
 		if (override) return this.normalizeLoc(override);
-		this.log(`Resolving node ${id} location via host ${node.host}`);
-		const byHost = await this.geoByHost(node.host).catch((e) => {
-			this.log(`Error during host geo lookup for ${id}: ${(e as Error).message}`);
-			return undefined;
-		});
-		if (byHost) return byHost;
-		return undefined;
+		return this.geoByHost(node.host);
 	};
 
-	/**
-	 * Queries free public APIs to geolocate an IP/hostname.
-	 * @param host Node host/IP.
-	 */
 	private geoByHost = async (host: string): Promise<LatLon | undefined> => {
-		const urls = [
-			`https://ipwho.is/${encodeURIComponent(host)}?fields=success,latitude,longitude`,
-			`http://ip-api.com/json/${encodeURIComponent(host)}?fields=status,lat,lon`,
-		];
+		const urls = [`https://ipwho.is/${encodeURIComponent(host)}?fields=success,latitude,longitude`, `https://ipapi.co/${encodeURIComponent(host)}/json/`];
+
 		for (const url of urls) {
-			this.log(`Fetching geo for ${host} via ${url}`);
-			const data = await this.fetchJson<GeoApiResponse>(url, 4500).catch((e) => {
-				this.log(`Geo fetch error for ${host} via ${url}: ${(e as Error).message}`);
-				return undefined;
-			});
-			if (!data) continue;
-			if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') return { lat: data.latitude, lon: data.longitude };
-			if ('status' in data && data.status === 'success' && typeof data.lat === 'number' && typeof data.lon === 'number') return { lat: data.lat, lon: data.lon };
+			try {
+				this.log(`Fetching geo for ${host} via ${url}`);
+				const data = await this.fetchJson<GeoApiResponse>(url, 5000);
+
+				if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') {
+					return { lat: data.latitude, lon: data.longitude };
+				}
+
+				if ('status' in data && data.status === 'success' && typeof data.lat === 'number' && typeof data.lon === 'number') {
+					return { lat: data.lat, lon: data.lon };
+				}
+			} catch (e) {
+				this.log(`Geo fetch error for ${host}: ${(e as Error).message}`);
+			}
 		}
+
 		return undefined;
 	};
 
-	/**
-	 * Computes the target location for a guild: cached voice region -> lat/lon, user resolver, or bot host.
-	 * @param guildId Guild ID.
-	 */
 	private getTargetForGuild = async (guildId: string): Promise<LatLon | undefined> => {
 		const cached = this.guildGeo.get(guildId);
 		if (cached) return cached;
+
 		if (this.options.getGuildLocation) {
-			const v = await this.options.getGuildLocation(guildId);
-			if (v) {
-				const ll = await this.normalizeLoc(v);
-				if (ll) {
-					this.guildGeo.set(guildId, ll);
-					return ll;
+			try {
+				const v = await this.options.getGuildLocation(guildId);
+				if (v) {
+					const ll = await this.normalizeLoc(v);
+					if (ll) {
+						this.guildGeo.set(guildId, ll);
+						return ll;
+					}
 				}
+			} catch {
+				// ignore resolver errors
 			}
 		}
-		return this.getSelfLocationCached();
+
+		if (this.selfGeoPromise) {
+			const selfLoc = await this.selfGeoPromise;
+			if (selfLoc) return selfLoc;
+		}
+
+		return this.selfGeo;
 	};
 
-	/**
-	 * Fast, synchronous variant that returns only cached data for a guild's target location.
-	 * This avoids returning a Promise during Manager.create, which would otherwise force
-	 * a fallback path before async resolution completes.
-	 *
-	 * Order: cached guild region -> cached self (host) geolocation -> undefined
-	 */
 	private getTargetForGuildSync = (guildId: string): LatLon | undefined => {
 		return this.guildGeo.get(guildId) ?? this.selfGeo;
 	};
 
-	/**
-	 * Returns cached bot host geolocation; kicks off async fetch on first call.
-	 */
-	private getSelfLocationCached = (): LatLon | undefined => {
-		if (this.selfGeo) return this.selfGeo;
-		this.log('Self geo not cached, triggering background fetch');
-		void this.getSelfLocation()
-			.then((ll) => {
-				this.selfGeo = ll;
-				if (ll) this.log(`Self location cached => ${ll.lat.toFixed(2)},${ll.lon.toFixed(2)}`);
-			})
-			.catch((e) => this.log(`Self geo fetch error: ${(e as Error).message}`));
-		return this.selfGeo;
-	};
-
-	/**
-	 * Fetches bot host geolocation using public APIs.
-	 */
 	private getSelfLocation = async (): Promise<LatLon | undefined> => {
-		this.log('Fetching self geo from ipwho.is');
-		const data = await this.fetchJson<IpWhoResponse>('https://ipwho.is/?fields=success,latitude,longitude', 4500).catch((e) => {
-			this.log(`Self geo fetch error (ipwho.is): ${(e as Error).message}`);
-			return undefined;
-		});
-		if (data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') return { lat: data.latitude, lon: data.longitude };
+		const urls = ['https://ipwho.is/?fields=success,latitude,longitude', 'https://ipapi.co/json/'];
 
-		this.log('Fetching self geo from ip-api.com');
-		const data2 = await this.fetchJson<IpApiResponse>('http://ip-api.com/json/?fields=status,lat,lon', 4500).catch((e) => {
-			this.log(`Self geo fetch error (ip-api.com): ${(e as Error).message}`);
-			return undefined;
-		});
-		if (data2 && data2.status === 'success' && typeof data2.lat === 'number' && typeof data2.lon === 'number') return { lat: data2.lat, lon: data2.lon };
+		for (const url of urls) {
+			try {
+				this.log(`Fetching self geo from ${url}`);
+				const data = await this.fetchJson<GeoApiResponse>(url, 5000);
+
+				if ('success' in data && data.success && typeof data.latitude === 'number' && typeof data.longitude === 'number') {
+					return { lat: data.latitude, lon: data.longitude };
+				}
+
+				if ('status' in data && data.status === 'success' && typeof data.lat === 'number' && typeof data.lon === 'number') {
+					return { lat: data.lat, lon: data.lon };
+				}
+			} catch (e) {
+				this.log(`Self geo fetch error: ${(e as Error).message}`);
+			}
+		}
 
 		return undefined;
 	};
 
-	/**
-	 * Great-circle distance between two coordinates using the Haversine formula.
-	 * @param a Point A
-	 * @param b Point B
-	 * @returns Distance in kilometers
-	 */
 	private haversineKm = (a: LatLon, b: LatLon): number => {
 		const toRad = (x: number) => (x * Math.PI) / 180;
-		const R = 6371; // km
+		const R = 6371;
 		const dLat = toRad(b.lat - a.lat);
 		const dLon = toRad(b.lon - a.lon);
 		const lat1 = toRad(a.lat);
@@ -365,117 +351,63 @@ export class MagmaConnect extends Plugin {
 		return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 	};
 
-	/**
-	 * Normalizes either a coordinate or a region code to a coordinate.
-	 * @param v Coordinate or region wrapper.
-	 */
 	private normalizeLoc = async (v: LatLon | { region: string }): Promise<LatLon | undefined> => {
-		if ('lat' in v) return v;
-		const ll = this.regionToLatLon(v.region);
-		return ll;
-	};
-
-	/**
-	 * Extracts a Voice Server Update shape from multiple possible payloads.
-	 */
-	private extractVoiceServerUpdate = (data: unknown): VoiceServerUpdate | undefined => {
-		if (data && typeof data === 'object') {
-			const anyData = data as Record<string, any>;
-			// Discord gateway packet style
-			if (anyData.t === 'VOICE_SERVER_UPDATE' && anyData.d && typeof anyData.d.endpoint === 'string' && typeof anyData.d.guild_id === 'string') {
-				return { guild_id: anyData.d.guild_id, endpoint: anyData.d.endpoint };
-			}
-			// Raw VoiceServer style
-			if ('endpoint' in anyData && typeof (anyData as any).endpoint === 'string' && 'guild_id' in anyData && typeof (anyData as any).guild_id === 'string') {
-				return { guild_id: (anyData as any).guild_id, endpoint: (anyData as any).endpoint };
-			}
-			// VoiceState-like event wrapper
-			if ('event' in anyData && anyData.event && typeof anyData.event.endpoint === 'string' && typeof anyData.event.guild_id === 'string') {
-				return { guild_id: anyData.event.guild_id, endpoint: anyData.event.endpoint };
-			}
-		}
+		if ('lat' in v && 'lon' in v) return v;
+		if ('region' in v) return this.regionToLatLon(v.region);
 		return undefined;
 	};
 
-	/**
-	 * Parses a Discord media endpoint hostname into a region label.
-	 * @param endpoint e.g., "us-east123.discord.media:443"
-	 */
+	private extractVoiceServerUpdate = (data: unknown): VoiceServerUpdate | undefined => {
+		if (!data || typeof data !== 'object') return undefined;
+
+		const anyData = data as Record<string, unknown>;
+
+		if (anyData.t === 'VOICE_SERVER_UPDATE' && anyData.d && typeof anyData.d === 'object') {
+			const d = anyData.d as Record<string, unknown>;
+			if (typeof d.endpoint === 'string' && typeof d.guild_id === 'string') {
+				return { guild_id: d.guild_id, endpoint: d.endpoint };
+			}
+		}
+
+		if (typeof anyData.endpoint === 'string' && typeof anyData.guild_id === 'string') {
+			return { guild_id: anyData.guild_id, endpoint: anyData.endpoint };
+		}
+
+		if (anyData.event && typeof anyData.event === 'object') {
+			const event = anyData.event as Record<string, unknown>;
+			if (typeof event.endpoint === 'string' && typeof event.guild_id === 'string') {
+				return { guild_id: event.guild_id, endpoint: event.endpoint };
+			}
+		}
+
+		return undefined;
+	};
+
 	private parseDiscordRegionFromEndpoint = (endpoint: string): string | undefined => {
 		const host = endpoint.split(':')[0];
 		const parts = host.split('.');
-		if (parts.length < 3) return undefined;
+		if (parts.length < 1) return undefined;
 		const first = parts[0];
 		const region = first.replace(/\d+$/, '');
 		return region || undefined;
 	};
 
-	/**
-	 * Maps common region names to approximate lat/lon coordinates.
-	 */
 	private regionToLatLon = (region: string): LatLon | undefined => {
-		const key = region.toLowerCase();
-		const map: Record<string, LatLon> = {
-			'us-east': { lat: 39.0, lon: -77.0 },
-			'us-west': { lat: 37.4, lon: -122.0 },
-			'us-central': { lat: 41.6, lon: -93.6 },
-			'us-south': { lat: 29.4, lon: -98.5 },
-			brazil: { lat: -23.5, lon: -46.6 },
-			singapore: { lat: 1.29, lon: 103.85 },
-			hongkong: { lat: 22.32, lon: 114.17 },
-			'hong-kong': { lat: 22.32, lon: 114.17 },
-			russia: { lat: 55.75, lon: 37.62 },
-			europe: { lat: 50.11, lon: 8.68 },
-			'eu-central': { lat: 50.11, lon: 8.68 },
-			'eu-west': { lat: 48.86, lon: 2.35 },
-			sydney: { lat: -33.86, lon: 151.21 },
-			japan: { lat: 35.68, lon: 139.69 },
-			india: { lat: 19.08, lon: 72.88 },
-			southafrica: { lat: -26.2, lon: 28.04 },
-			'south-africa': { lat: -26.2, lon: 28.04 },
-			dubai: { lat: 25.2, lon: 55.27 },
-			frankfurt: { lat: 50.11, lon: 8.68 },
-			london: { lat: 51.51, lon: -0.13 },
-			amsterdam: { lat: 52.37, lon: 4.9 },
-			mumbai: { lat: 19.08, lon: 72.88 },
-			chicago: { lat: 41.88, lon: -87.62 },
-			atlanta: { lat: 33.75, lon: -84.39 },
-			dallas: { lat: 32.78, lon: -96.8 },
-			miami: { lat: 25.77, lon: -80.19 },
-			newyork: { lat: 40.71, lon: -74.01 },
-			'new-york': { lat: 40.71, lon: -74.01 },
-			paris: { lat: 48.86, lon: 2.35 },
-			stockholm: { lat: 59.33, lon: 18.06 },
-			seoul: { lat: 37.57, lon: 126.98 },
-			toronto: { lat: 43.65, lon: -79.38 },
-			montreal: { lat: 45.5, lon: -73.57 },
-		};
-		return map[key];
+		return REGION_COORDINATES[region.toLowerCase()];
 	};
 
-	/**
-	 * Lightweight JSON GET using Node's http/https modules.
-	 * @param url Resource URL
-	 * @param timeoutMs Request timeout in milliseconds
-	 */
 	private fetchJson = async <T = unknown>(url: string, timeoutMs = 5000): Promise<T> => {
 		return new Promise<T>((resolve, reject) => {
 			const u = new URL(url);
-			const isHttp = u.protocol === 'http:';
-			const mod = isHttp ? require('http') : require('https');
-
-			interface HttpResponse {
-				statusCode?: number;
-				on: (event: string, callback: (data?: Buffer) => void) => void;
-				resume: () => void;
-			}
+			const isHttps = u.protocol === 'https:';
+			const mod = isHttps ? https : http;
 
 			const req = mod.request(
 				u,
 				{
 					method: 'GET',
 					timeout: timeoutMs,
-					headers: { 'user-agent': 'magma-connect/0.1' },
+					headers: { 'User-Agent': 'MagmaConnect/1.0' },
 				},
 				(res: HttpResponse) => {
 					const statusCode = res.statusCode ?? 0;
@@ -484,6 +416,7 @@ export class MagmaConnect extends Plugin {
 						reject(new Error(`HTTP ${statusCode}`));
 						return;
 					}
+
 					const chunks: Buffer[] = [];
 					res.on('data', (c?: Buffer) => {
 						if (c) chunks.push(c);
@@ -498,29 +431,16 @@ export class MagmaConnect extends Plugin {
 					});
 				}
 			);
+
 			req.on('error', reject);
-			req.on('timeout', () => req.destroy(new Error('Request timeout')));
+			req.on('timeout', () => {
+				req.destroy();
+				reject(new Error('Request timeout'));
+			});
 			req.end();
 		});
 	};
 
-	/**
-	 * If a promise-like is passed, returns undefined to avoid blocking a sync path.
-	 * Otherwise returns the value directly.
-	 */
-	private resolveSyncOrAsync = <T>(v: T | Promise<T> | undefined): T | undefined => {
-		if (v && typeof (v as Promise<T>).then === 'function') return undefined;
-		return v as T | undefined;
-	};
-
-	/**
-	 * Debug logger for the plugin.
-	 *
-	 * Prefixed with [MAGMACONNECT] and only emits output when `options.debug` is true.
-	 * Use this for internal diagnostics; production users can disable by leaving `debug` unset/false.
-	 *
-	 * @param msg The message to print when debug logging is enabled.
-	 */
 	private log = (msg: string): void => {
 		if (this.options.debug) console.log(`[MAGMACONNECT] ${msg}`);
 	};
